@@ -32,8 +32,53 @@
 /*  File: HCompV.c: HMM global mean/variance initialisation    */
 /* ----------------------------------------------------------- */
 
+/*  *** THIS IS A MODIFIED VERSION OF HTK ***                        */
+/* ----------------------------------------------------------------- */
+/*           The HMM-Based Speech Synthesis System (HTS)             */
+/*           developed by HTS Working Group                          */
+/*           http://hts.sp.nitech.ac.jp/                             */
+/* ----------------------------------------------------------------- */
+/*                                                                   */
+/*  Copyright (c) 2001-2015  Nagoya Institute of Technology          */
+/*                           Department of Computer Science          */
+/*                                                                   */
+/*                2001-2008  Tokyo Institute of Technology           */
+/*                           Interdisciplinary Graduate School of    */
+/*                           Science and Engineering                 */
+/*                                                                   */
+/* All rights reserved.                                              */
+/*                                                                   */
+/* Redistribution and use in source and binary forms, with or        */
+/* without modification, are permitted provided that the following   */
+/* conditions are met:                                               */
+/*                                                                   */
+/* - Redistributions of source code must retain the above copyright  */
+/*   notice, this list of conditions and the following disclaimer.   */
+/* - Redistributions in binary form must reproduce the above         */
+/*   copyright notice, this list of conditions and the following     */
+/*   disclaimer in the documentation and/or other materials provided */
+/*   with the distribution.                                          */
+/* - Neither the name of the HTS working group nor the names of its  */
+/*   contributors may be used to endorse or promote products derived */
+/*   from this software without specific prior written permission.   */
+/*                                                                   */
+/* THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND            */
+/* CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,       */
+/* INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF          */
+/* MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE          */
+/* DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS */
+/* BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,          */
+/* EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED   */
+/* TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,     */
+/* DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON */
+/* ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,   */
+/* OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY    */
+/* OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE           */
+/* POSSIBILITY OF SUCH DAMAGE.                                       */
+/* ----------------------------------------------------------------- */
+
 char *hcompv_version = "!HVER!HCompV:   3.4.1 [CUED 12/03/09]";
-char *hcompv_vc_id = "$Id: HCompV.c,v 1.1.1.1 2006/10/11 09:54:59 jal58 Exp $";
+char *hcompv_vc_id = "$Id: HCompV.c,v 1.18 2015/12/21 02:02:24 uratec Exp $";
 
 
 /* 
@@ -60,6 +105,7 @@ char *hcompv_vc_id = "$Id: HCompV.c,v 1.1.1.1 2006/10/11 09:54:59 jal58 Exp $";
 #include "HParm.h"
 #include "HLabel.h"
 #include "HModel.h"
+#include "HTrain.h"
 #include "HUtil.h"
 
 /* -------------------------- Trace Flags & Vars ------------------------ */
@@ -87,10 +133,12 @@ static FileFormat lff=UNDEFF;       /* label file format */
 static char *hmmfn=NULL;            /* HMM definition file name */
 static char *outfn=NULL;            /* output HMM file name (name only) */
 static char *outDir=NULL;           /* HMM output directory */
-static long totalCount=0;           /* total number of vector samples*/
 static Boolean meanUpdate = FALSE;  /* update means  */
 static Boolean saveBinary = FALSE;  /* save output in binary  */
 static float vFloorScale = 0.0;     /* if >0.0 then vFloor scaling */
+static Vector vFloorScaleStr = NULL; /* vFloorScale for each stream */
+static int nShowElem = 12;           /* # of elements to be shown */
+static int parallel_mode = -1;       /* enable parallel execution mode */
 
 /* Major Data Structures */
 static MLink macroLink;             /* Link to specific HMM macro */
@@ -101,9 +149,11 @@ static MemHeap iStack;
 
 /* Storage for mean and covariance accumulators */
 typedef struct {
-   Vector       meanSum;            /* acc for mean vector value */
-   Covariance   squareSum;          /* acc for sum of squares */
+   DVector      meanSum;            /* acc for mean vector value */
+   DMatrix      inv;                /* acc for sum of squares (full) */
+   DVector      var;                /* acc for sum of squares (diag) */
    Covariance   fixed;              /* fixed (co)variance values */
+   double       totalCount;         /* total number of vector samples */
 } CovAcc;
 static CovAcc accs[SMAX];           /* one CovAcc for each stream */
 static Boolean fullcNeeded[SMAX];   /* true for each stream that needs full
@@ -143,18 +193,24 @@ void SetConfParms(void)
    Boolean b,c;
    int i;
    double d;
+   char buf[MAXSTRLEN];
    
    nParm = GetConfig("HCOMPV", TRUE, cParm, MAXGLOBS);
    if (nParm>0) {
       if (GetConfInt(cParm,nParm,"TRACE",&i)) trace = i;
       if (GetConfBool(cParm,nParm,"UPDATEMEANS",&b)) meanUpdate = b;
       if (GetConfBool(cParm,nParm,"SAVEBINARY",&c)) saveBinary = c;
+      if (GetConfInt(cParm,nParm,"NSHOWELEM",&i)) nShowElem = i;
       if (GetConfFlt(cParm,nParm,"MINVARFLOOR",&d)) minVar = d;
+      if (GetConfFlt(cParm,nParm,"VFLOORSCALE",&d)) vFloorScale = d;
+      if (GetConfStr(cParm,nParm,"VFLOORSCALESTR",buf))
+         vFloorScaleStr = ParseConfVector(&gstack,buf,TRUE);
    }
 }
 
 void ReportUsage(void)
 {
+   printf("\nModified for HTS\n");
    printf("\nUSAGE: HCompV [options] [hmmFile] trainFiles...\n" );
    printf(" Option                                       Default\n\n");
    printf(" -c dir  Set output directiry for CMV         none\n");
@@ -165,6 +221,7 @@ void ReportUsage(void)
    printf(" -o fn   Store new hmm def in fn (name only)  outDir/srcfn\n");
    printf(" -p s    path pattern for CMV                 none\n");
    printf(" -q nmv  output type flags for CMV            m\n");
+   printf(" -r n    set parallel mode to N                            off\n");
    printf(" -v f    Set minimum variance to f            0.0\n");
    PrintStdOpts("BCFGHILMX");
    printf("\n\n");
@@ -179,15 +236,18 @@ void CheckVarianceKind(void)
    int i,s,m;
    StateElem *se;
    StreamElem *ste;
+   StreamInfo *sti;
    MixtureElem *me;
    
    for (s=1;s<=hset.swidth[0];s++)
       fullcNeeded[s]=FALSE;
    for (i=2,se=hmmLink->svec+2; i < hmmLink->numStates; i++,se++)
-      for (s=1,ste=se->info->pdf+1; s <= hset.swidth[0]; s++,ste++)
-         for (m=1,me = ste->spdf.cpdf+1; m<=ste->nMix; m++, me++)
+      for (s=1,ste=se->info->pdf+1; s <= hset.swidth[0]; s++,ste++) {
+         sti = ste->info;
+         for (m=1,me = sti->spdf.cpdf+1; m<=sti->nMix; m++, me++)
             if (me->mpdf->ckind == FULLC) 
                fullcNeeded[s] = TRUE;
+}
 }
 
 /* Initialise: load HMMs and create accumulators */
@@ -224,18 +284,19 @@ void Initialise(void)
    /* Create accumulators for the mean and variance */
    for (s=1;s<=hset.swidth[0]; s++){
       V = hset.swidth[s];
-      accs[s].meanSum=CreateVector(&gstack,V);
-      ZeroVector(accs[s].meanSum);
+      accs[s].meanSum=CreateDVector(&gstack,V);
+      ZeroDVector(accs[s].meanSum);
       if (fullcNeeded[s]) {
-         accs[s].squareSum.inv=CreateSTriMat(&gstack,V);
-         accs[s].fixed.inv=CreateSTriMat(&gstack,V);
-         ZeroTriMat(accs[s].squareSum.inv);
+         accs[s].inv=CreateDMatrix(&gstack,V,V);
+         accs[s].fixed.inv=CreateTriMat(&gstack,V);
+         ZeroDMatrix(accs[s].inv);
       }
       else {
-         accs[s].squareSum.var=CreateSVector(&gstack,V);
-         accs[s].fixed.var=CreateSVector(&gstack,V);
-         ZeroVector(accs[s].squareSum.var);
+         accs[s].var=CreateDVector(&gstack,V);
+         accs[s].fixed.var=CreateVector(&gstack,V);
+         ZeroDVector(accs[s].var);
       }
+      accs[s].totalCount = 0.0;
    }
 
    /* Create an object to hold the input parameters */
@@ -245,6 +306,13 @@ void Initialise(void)
       segId = GetLabId(segLab,TRUE);
    }
 
+   /* Check threshold */
+   if (vFloorScaleStr==NULL) {
+      vFloorScaleStr = CreateVector(&gstack, hset.swidth[0]);
+      for (s=1; s<=hset.swidth[0]; s++)
+         vFloorScaleStr[s] = vFloorScale;
+   }
+   
    if (trace&T_TOP) {
       printf("Calculating Fixed Variance\n");
       printf("  HMM Prototype: %s\n",hmmfn);
@@ -255,21 +323,95 @@ void Initialise(void)
    }
 }
 
+
+/* Dump CovAcc to a file. */
+void DumpCovAccs() {
+  char accs_filename[MAXFNAMELEN];
+  MakeFN("HCompV$.acc", outDir, NULL, accs_filename);
+  FILE *f = GetDumpFile(accs_filename, parallel_mode);
+
+  /* Dump accumulators for the mean and variance to f */
+  int s;
+  for (s = 1; s <= hset.swidth[0]; ++s) {
+    WriteShort(f, &hset.swidth[s], 1, saveBinary);
+    WriteDVector(f, accs[s].meanSum, saveBinary);
+    if (fullcNeeded[s]) {
+      WriteDMatrix(f, accs[s].inv, saveBinary);
+    } else {
+      WriteDVector(f, accs[s].var, saveBinary);
+    }
+    WriteDouble(f, &accs[s].totalCount, 1, saveBinary);
+  }
+  fclose(f);
+}
+
+/* Load dumped CovAcc and add it to CovAcc. */
+void LoadCovAccs(char *accs_filename) {
+  Source src;
+  if (InitSource(accs_filename, &src, NoFilter) < SUCCESS) {
+    HError(7110, "LoadCovAccs: Can't open file %s", accs_filename);
+  }
+  int i, j, s, k;
+  for (s = 1; s <= hset.swidth[0]; ++s) {
+    short vec_size;
+    ReadShort(&src, &vec_size, 1, saveBinary);
+    if (vec_size != hset.swidth[s]) {
+      HError(9999, "LoadCovAccs: mismatch in stream width[%d] (%d vs %d)",
+             s, hset.swidth[s], vec_size);
+    }
+    DVector vec = CreateDVector(&gstack, vec_size);
+    DMatrix mat = CreateDMatrix(&gstack, vec_size, vec_size);;
+    ReadDVector(&src, vec, saveBinary);
+    for (k = 1; k <= vec_size; ++k) {
+      if (!finite(vec[k])) {
+        HError(7191, "LoadCovAccs: Infinite CovAcc!");
+      }
+      accs[s].meanSum[k] += vec[k];
+    }
+    if (!fullcNeeded[s]) {
+      ReadDVector(&src, vec, saveBinary);
+      for (k = 1; k <= vec_size; ++k) {
+        if (!finite(vec[k])) {
+          HError(7191, "LoadCovAccs: Infinite CovAcc!");
+        }
+        accs[s].var[k] += vec[k];
+      }
+    } else {
+      ReadDMatrix(&src, mat, saveBinary);
+      for (i = 1; i <= vec_size; ++i) {
+        for (j = 1; j <= vec_size; ++j) {
+          if (!finite(mat[i][j])) {
+            HError(7191, "LoadCovAccs: Infinite CovAcc!");
+          }
+          accs[s].inv[i][j] += mat[i][j];
+        }
+      }
+    }
+    double total_count;
+    ReadDouble(&src, &total_count, 1, saveBinary);
+    if (!finite(total_count)) {
+      HError(7191, "LoadCovAccs: Infinite CovAcc!");
+    }
+    accs[s].totalCount += total_count;
+  }
+}
+
 /* ----------------------[Co]Variance Estimation ---------------------- */
 
 /* CalcCovs: calculate covariance of speech data */
 void CalcCovs(void)
 {
-   int x,y,s,V;
-   float meanx,meany,varxy,n;
+   int i,j,x,y,s,V;
+   double meanx,meany,varxy,n;
    Matrix fullMat;
+   TriMat triMat;
    
-   if (totalCount<2)
-      HError(2021,"CalcCovs: Only %d speech frames accumulated",totalCount);
-   if (trace&T_TOP)
-      printf("%ld speech frames accumulated\n", totalCount);
-   n = (float)totalCount;     /* to prevent rounding to integer below */
    for (s=1; s<=hset.swidth[0]; s++){  /* For each stream   */
+      if (accs[s].totalCount<2.0)
+         HError(2021,"CalcCovs: Only %.0lf speech frames accumulated for stream %d", accs[s].totalCount, s);
+      if (trace&T_TOP)
+         printf("%.0lf speech frames accumulated for stream %d\n", accs[s].totalCount, s);
+      n = (double)accs[s].totalCount; /* to prevent rounding to integer below */
       V = hset.swidth[s];
       for (x=1; x<=V; x++)            /* For each coefficient ... */
          accs[s].meanSum[x] /= n;         /* ... calculate mean */
@@ -278,31 +420,43 @@ void CalcCovs(void)
          if (fullcNeeded[s]) {
             for (y=1; y<=x; y++) {
                meany = accs[s].meanSum[y];
-               varxy = accs[s].squareSum.inv[x][y]/n - meanx*meany;
-               accs[s].squareSum.inv[x][y] =
-                  (x != y || varxy > minVar) ? varxy : minVar;    
+               varxy = accs[s].inv[x][y]/n - meanx*meany;
+               accs[s].inv[x][y] =
+                  (x != y || varxy > (double)minVar) ? varxy : (double)minVar;    
             }
          }
          else {
-            varxy = accs[s].squareSum.var[x]/n - meanx*meanx;
-            accs[s].fixed.var[x] = (varxy > minVar) ? varxy :minVar;
+            varxy = accs[s].var[x]/n - meanx*meanx;
+            accs[s].fixed.var[x] = (varxy > (double)minVar) ? (float)varxy : minVar;
          }
       }
       if (fullcNeeded[s]) { /* invert covariance matrix */
+         /* prepare temporaly full & triangle matrices */
+         triMat=CreateTriMat(&gstack,V);
          fullMat=CreateMatrix(&gstack,V,V);
          ZeroMatrix(fullMat); 
-         CovInvert(accs[s].squareSum.inv,fullMat);
+         
+         /* copy full double matrix to triangular float matrix */
+         for (i=1; i<=V; i++)
+            for (j=1; j<=i; j++) 
+               triMat[i][j] = (float)accs[s].inv[i][j];
+
+         /* Covariance -> InvCov */
+         CovInvert(triMat,fullMat);
          Mat2Tri(fullMat,accs[s].fixed.inv);
+         
+         /* Free temporaly full & triangle matrices */
          FreeMatrix(&gstack,fullMat);
+         FreeTriMat(&gstack,triMat);
       }
       if (trace&T_COVS) {
          printf("Stream %d\n",s);
          if (meanUpdate)
-            ShowVector(" Mean Vector ", accs[s].meanSum,12);
+            ShowDVector(" Mean Vector ", accs[s].meanSum, nShowElem);
          if (fullcNeeded[s]) {
-            ShowTriMat(" Covariance Matrix ",accs[s].squareSum.inv,12,12);
+            ShowTriMat(" Inverse Covariance Matrix ",accs[s].fixed.inv,nShowElem,nShowElem);
          } else
-            ShowVector(" Variance Vector ", accs[s].fixed.var,12);
+            ShowVector(" Variance Vector ", accs[s].fixed.var,nShowElem);
       }
    }
 }
@@ -322,9 +476,10 @@ void TriDiag2Vector(TriMat m, Vector v)
 /* SetCovs: set covariance values in hmm */
 void SetCovs(void)
 {
-   int i,s,m;
+   int i,k,s,m;
    StateElem *se;
    StreamElem *ste;
+   StreamInfo *sti;
    MixtureElem *me;
    MixPDF *mp;
 
@@ -335,23 +490,33 @@ void SetCovs(void)
       printf("Covariances\n");
    }
    for (i=2,se=hmmLink->svec+2; i < hmmLink->numStates; i++,se++)
-      for (s=1,ste=se->info->pdf+1; s <= hset.swidth[0]; s++,ste++)
-         for (m=1,me = ste->spdf.cpdf+1; m<=ste->nMix; m++, me++) {
+      for (s=1,ste=se->info->pdf+1; s <= hset.swidth[0]; s++,ste++) {
+         sti = ste->info;
+         for (m=1,me = sti->spdf.cpdf+1; m<=sti->nMix; m++, me++) {
             mp = me->mpdf;
             if (meanUpdate && !IsSeenV(mp->mean)){      /* meanSum now holds mean */
-               CopyVector(accs[s].meanSum,mp->mean); 
+               if ( VectorSize(mp->mean)==DVectorSize(accs[s].meanSum) )
+                  for (k=1;k<=VectorSize(mp->mean);k++)
+                     mp->mean[k] = (float)accs[s].meanSum[k];
                TouchV(mp->mean);
             }
             if (!IsSeenV(mp->cov.var)){
-               if (mp->ckind==FULLC)
+               if (mp->ckind==FULLC) {
+                  if ( TriMatSize(accs[s].fixed.inv)==TriMatSize(mp->cov.inv) )
                   CopyMatrix(accs[s].fixed.inv,mp->cov.inv);
-               else if (fullcNeeded[s])  /* dont need full cov, but its all we have */                
+               }
+               else if (fullcNeeded[s]) {  /* dont need full cov, but its all we have */                
+                  if ( TriMatSize(accs[s].fixed.inv)==VectorSize(mp->cov.var) )
                   TriDiag2Vector(accs[s].fixed.inv,mp->cov.var);
-               else
+               }
+               else {
+                  if ( VectorSize(mp->cov.var)==VectorSize(accs[s].fixed.var) )
                   CopyVector(accs[s].fixed.var,mp->cov.var);
+               }
                TouchV(mp->cov.var);
             }
          }
+      }
    ClearSeenFlags(&hset,CLR_ALL);
 }
 
@@ -372,11 +537,12 @@ void PutVFloor(void)
       strcpy(vName,"varFloor"); strcat(vName,num);
       fprintf(f,"~v %s\n",vName);
       if (fullcNeeded[s])              
-         TriDiag2Vector(accs[s].squareSum.inv,v);
+         for (i=1;i<=hset.swidth[s];i++)
+            v[i] = (float)accs[s].inv[i][i];
       else
          CopyVector(accs[s].fixed.var,v);
       for (i=1; i<=hset.swidth[s]; i++)
-         v[i] *= vFloorScale;
+         v[i] *= vFloorScaleStr[s];
       fprintf(f,"<Variance> %d\n",hset.swidth[s]);
       WriteVector(f,v,FALSE);
       FreeVector(&gstack,v);
@@ -392,21 +558,23 @@ void PutVFloor(void)
 void AccVar(Observation obs)
 {
    int x,y,s,V;
-   float val;
+   double val;
    Vector v;
 
-   totalCount++;
    for (s=1; s<=hset.swidth[0]; s++){
       v = obs.fv[s]; V = hset.swidth[s];
+      if (SpaceOrder(v)==V) {
       for (x=1;x<=V;x++) { 
-         val=v[x];            
+            val=(double)v[x];            
          accs[s].meanSum[x] += val;     /* accumulate mean */                             
          if (fullcNeeded[s]) {          /* accumulate covar */ 
-            accs[s].squareSum.inv[x][x] += val*val;
+               accs[s].inv[x][x] += val*val;
             for (y=1;y<x;y++) 
-               accs[s].squareSum.inv[x][y] += val*v[y];
+                  accs[s].inv[x][y] += val*(double)v[y];
          } else                         /* accumulate var */
-            accs[s].squareSum.var[x] += val*val;
+               accs[s].var[x] += val*val;
+         }
+         accs[s].totalCount += 1.0;   /* accumulate occ */
       }
    }
 }
@@ -427,7 +595,7 @@ void LoadFile(char *fn)
 {
    ParmBuf pbuf;
    BufferInfo info;
-   char labfn[80];
+   char labfn[MAXSTRLEN];
    Transcription *trans;
    long segStIdx,segEnIdx;  
    int i,j,ncas,nObs;
@@ -758,6 +926,7 @@ int main(int argc, char *argv[])
    InitVQ();    InitModel();
    if(InitParm()<SUCCESS)  
       HError(2000,"HCompV: InitParm failed");
+   InitUtil();
 
    if (!InfoPrinted() && NumArgs() == 0)
       ReportUsage();
@@ -772,7 +941,7 @@ int main(int argc, char *argv[])
          HError(2019,"HCompV: Bad switch %s; must be single letter",s);
       switch(s[0]){
       case 'f':
-         if (NextArg() != FLOATARG)
+         if (NextArg() != FLOATARG && NextArg() != INTARG)
             HError(2019,"HCompV: Variance floor scale expected");
          vFloorScale = GetChkedFlt(0.0,100.0,s);
          break;
@@ -787,8 +956,11 @@ int main(int argc, char *argv[])
       case 'o':
          outfn = GetStrArg();
          break;     
+      case 'r':
+        parallel_mode = GetChkedInt(-1, 2000, s);
+        break;
       case 'v':
-         if (NextArg() != FLOATARG)
+         if (NextArg() != FLOATARG && NextArg() != INTARG)
             HError(2019,"HCompV: Minimum variance level expected");
          minVar = GetChkedFlt(0.0,100.0,s);
          break;
@@ -877,17 +1049,31 @@ int main(int argc, char *argv[])
          if (NextArg()!=STRINGARG)
             HError(2019,"HCompV: Training data file name expected");
          datafn = GetStrArg();
+         if (parallel_mode == 0) {
+            LoadCovAccs(datafn);
+         } else {
          LoadFile(datafn);
+         }
       } while (NumArgs()>0);
+      if (parallel_mode <= 0) {
       SetCovs();
       FixGConsts(hmmLink);
       SaveModel(outfn);   
       if (trace&T_TOP)
          printf("Output written to directory %s\n",(outDir==NULL)?"./":outDir);
-      if (vFloorScale>0.0)
          PutVFloor();
+      } else {
+         DumpCovAccs();
+         if (trace & T_TOP) {
+            printf("Accumulated statistics written to directory %s\n", (outDir == NULL) ? "./" : outDir);
+         }
+      }
+      FreeVector(&gstack,vFloorScaleStr);
    }
    else {
+      if (parallel_mode >= 0) {
+         HError(9999, "HCompV: parallel mode is not supported for computing CMV.");
+      }
       /* report export data type */
       ReportOutput();
       /* init input buffer mem heap */
@@ -909,6 +1095,17 @@ int main(int argc, char *argv[])
       ExportNMV(salist,cmDir,TargetPKStr);
    }
 
+   ResetParm();
+   ResetModel();
+   ResetVQ();
+   ResetAudio();
+   ResetWave();
+   ResetSigP();
+   ResetMath();
+   ResetLabel();
+   ResetMem();
+   ResetShell();   
+   
    Exit(0);
    return (0);          /* never reached -- make compiler happy */
 }
